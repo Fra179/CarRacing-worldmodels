@@ -1,0 +1,16 @@
+[project]
+name = "car-racing"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "gymnasium[box2d]==0.29.1",
+    "lightning>=2.6.0",
+    "matplotlib>=3.10.8",
+    "numpy==1.24.4",
+    "scikit-learn>=1.7.2",
+    "scipy>=1.15.3",
+    "torch>=2.9.1",
+    "torchvision>=0.24.1",
+]
