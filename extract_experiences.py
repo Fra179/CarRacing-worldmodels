@@ -29,7 +29,7 @@ def generate_data(dir_name, num_episodes, img_size):
         os.makedirs(dir_name)
         print(f"Created directory: {dir_name}")
 
-    env = gym.make("CarRacing-v2", render_mode=None)  # Set render_mode="human" to watch
+    env = gym.make("CarRacing-v2", render_mode=None) 
 
     start_time = time.time()
     idx = 0
@@ -45,7 +45,7 @@ def generate_data(dir_name, num_episodes, img_size):
         truncated = False
 
         for _ in range(50):
-            # skip the first 50 frames
+            # skip the first 50 frames due to them just being animation
             action = env.action_space.sample()
             next_obs, reward, done, truncated, info = env.step(action)
             obs = next_obs
@@ -58,9 +58,6 @@ def generate_data(dir_name, num_episodes, img_size):
             next_obs, reward, done, truncated, info = env.step(action)
 
             # Process and store
-            # Note: We store the observation *before* the action took place
-            # or the one resulting from it. Usually standard is (obs, action, next_obs)
-            # but for VAE we just need a massive pile of frames.
             processed_obs = preprocess_frame(obs, img_size)
 
             filename = os.path.join(dir_name, f"obs_{idx}.npy")

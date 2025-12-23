@@ -4,3 +4,10 @@ gymnasium==0.29.1
 gymnasium[box2d]
 scikit-learn
 torch 
+cma>=4.4.1,
+lightning>=2.6.0
+matplotlib>=3.10.8
+moviepy>=1.0.3
+numpy==1.24.4
+shapely>=2.1.2
+torchvision>=0.24.1

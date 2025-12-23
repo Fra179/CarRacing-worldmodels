@@ -1,65 +1,186 @@
-from torch import nn
+import torch
+import os
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from torch.utils.data import Dataset
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 
-class M(pl.LightningModule):
-    def __init__(self, latent_size=32, action_size=3, hidden_size=256, num_gaussians=5, lr=1e-3):
+# Allow running both as a module (python -m models.M) and as a script (python models/M.py)
+try:
+    from models.V import VAE
+except ImportError:  # fallback when executed directly from repo root
+    from V import VAE
+
+class MDN(nn.Module):
+    
+    def __init__(self, input_size, output_size, K, units=512):
         super().__init__()
-        self.save_hyperparameters()
+        
+        self.input_size = input_size
+        self.output_size = output_size
+        self.K = K
+        
+        self.l1 = nn.Linear(input_size, 3 * K * output_size)
+        
+        self.oneDivSqrtTwoPI = 1.0 / np.sqrt(2.0*np.pi)
+        
+    def forward(self, x):
+        batch_size, seq_len = x.shape[0],x.shape[1]
 
-        self.lstm = nn.LSTM(latent_size + action_size, hidden_size, batch_first=True)
-        self.fc_pi = nn.Linear(hidden_size, num_gaussians)
-        self.fc_mu = nn.Linear(hidden_size, num_gaussians * latent_size)
-        self.fc_sigma = nn.Linear(hidden_size, num_gaussians * latent_size)
+        out = self.l1(x)
+        pi, sigma, mu  = torch.split(out, (self.K * self.output_size , self.K * self.output_size, self.K * self.output_size), dim=2)
+        
+         
+        sigma = sigma.view(batch_size, seq_len, self.K, self.output_size)
+        sigma = torch.exp(sigma)
+        
+        mu = mu.view(batch_size, seq_len, self.K, self.output_size)
 
-    def forward(self, z, action, hidden_state=None):
-        # z: (Batch, Seq, Latent)
-        # action: (Batch, Seq, Action)
-        x = torch.cat([z, action], dim=2)
-        out, hidden = self.lstm(x, hidden_state)
+        pi = pi.view(batch_size, seq_len, self.K, self.output_size)
+        pi = F.softmax(pi, dim=2)
+        
+        return pi, sigma, mu
+    
+    def gaussian_distribution(self, y, mu, sigma):
+        y = y.unsqueeze(2).expand_as(sigma)
+        
+        out = (y - mu) / sigma
+        out = -0.5 * (out * out)
+        out = (torch.exp(out) / sigma) * self.oneDivSqrtTwoPI
 
-        # MDN heads
-        pi = F.softmax(self.fc_pi(out), dim=2)
-        mu = self.fc_mu(out).view(-1, out.size(1), self.hparams.num_gaussians, self.hparams.latent_size)
-        sigma = torch.exp(self.fc_sigma(out)).view(-1, out.size(1), self.hparams.num_gaussians,
-                                                   self.hparams.latent_size)
+        return out
+    
+    def loss(self, y, pi, mu, sigma):
 
-        return pi, mu, sigma, hidden
+        out = self.gaussian_distribution(y, mu, sigma)
+        out = out * pi
+        out = torch.sum(out, dim=2)
+        
+        # kill (inf) nan loss
+        out[out <= float(1e-24)] = 1
+        
+        out = -torch.log(out)
+        out = torch.mean(out)
+        
+        return out
 
-    def mdn_loss_function(self, pi, mu, sigma, target_z):
-        """
-        Calculates negative log-likelihood of target_z under the Mixture of Gaussians.
-        target_z: (Batch, Seq, Latent)
-        """
-        # Expand target for broadcasting against Num_Gaussians
-        # Target shape: (Batch, Seq, 1, Latent)
-        target = target_z.unsqueeze(2)
+class MDN_LSTM_DataSet(Dataset):
+    
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.data_files = filter(lambda x: x.endswith('.npz'), os.listdir(data_dir))
+        self.data_files = map(lambda x: os.path.join(data_dir, x), self.data_files)
+        self.data_files = list(self.data_files)
 
-        # Calculate Normal Probability: N(target | mu, sigma)
-        # Note: We use log_prob for numerical stability
-        dist = torch.distributions.Normal(mu, sigma)
-        log_probs = dist.log_prob(target)  # Shape: (Batch, Seq, G, Latent)
+        model = VAE.load_from_checkpoint('residual_vae_final.ckpt', latent_size=32).to('cpu')
+        model.eval()
+        self.vae = model
 
-        # Sum over latent dimensions (assuming diagonal covariance)
-        log_probs = torch.sum(log_probs, dim=3)  # Shape: (Batch, Seq, G)
+    def __len__(self):
+        return len(self.data_files) 
+    
+    def __getitem__(self, index):
+        data = np.load(self.data_files[index], allow_pickle=True)
+        obs = torch.from_numpy(data["obs"]).permute(0,3,1,2).float()
+        actions = data["action"]
 
-        # Combine with Mixing Coefficients (pi) using LogSumExp trick
-        # We want log( sum( pi * N(target) ) )
-        # = log_sum_exp( log(pi) + log_probs )
-        weighted_log_probs = torch.log(pi + 1e-8) + log_probs
-        log_likelihood = torch.logsumexp(weighted_log_probs, dim=2)
+        if obs.max() > 1.0:
+            obs = obs / 255.0
 
-        return -torch.mean(log_likelihood)
+        with torch.no_grad():
+            mu, logvar = self.vae.encode(obs)
+            z = self.vae.latent(mu, logvar).numpy()  # (episode_size, latent_size)
 
-    def training_step(self, batch, batch_idx):
-        # Batch should contain sequences: (z_seq, action_seq, target_z_seq)
-        # target_z_seq is essentially z_seq shifted by 1
-        z, action, target_z = batch
+        combined = np.concatenate([z, actions], axis=1)  # (episode_size, latent_size + action_dim)
+        x = combined[:-1].astype(np.float32)  # inputs for 0..episode_size-2
+        y = z[1:].astype(np.float32)   # targets for 1...episode_size-1
+        
+        return torch.from_numpy(x), torch.from_numpy(y)
+    
+class MDN_LSTM(pl.LightningModule):
 
-        pi, mu, sigma, _ = self(z, action)
-        loss = self.mdn_loss_function(pi, mu, sigma, target_z)
+    def __init__(self, input_size, output_size, mdn_units=512, hidden_size=256, num_mixs=5):
+        super(MDN_LSTM, self).__init__()
 
-        self.log("mdn_loss", loss)
+        self.hidden_size = hidden_size
+        self.num_mixs = num_mixs
+        self.input_size = input_size
+        self.output_size = output_size
+        
+        self.lstm = nn.LSTM(input_size, hidden_size, 1, batch_first=True)
+        self.mdn = MDN(hidden_size, output_size, num_mixs, mdn_units)
+
+    def forward(self, x, state=None):
+        
+        y = None
+        if state is None:
+            y, state = self.lstm(x)
+        else:
+            y, state = self.lstm(x, state)
+        
+        pi, sigma, mu = self.mdn(y)
+        
+        return pi, sigma, mu, state
+            
+    def forward_lstm(self, x, state=None):
+        
+        y = None
+        x = x.unsqueeze(0) # batch first
+        if state is None:
+            y, state = self.lstm(x)
+        else:
+            y, state = self.lstm(x, state)
+
+        return y, state
+
+    def loss(self, y, pi, mu, sigma):
+        loss = self.mdn.loss(y, pi, mu, sigma)
         return loss
 
+    def get_hidden_size(self):
+        return self.hidden_size
+    
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        return torch.optim.Adam(self.parameters(), lr=3e-3)
+    
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+
+        # Concatenate z and actions as input
+        pi, sigma, mu, _ = self.forward(x)
+        loss = self.loss(y, pi, mu, sigma)
+        
+        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+
+        return loss
+    
+
+def main():
+    dataset = MDN_LSTM_DataSet(data_dir="car_racing_data")
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=5, shuffle=True, num_workers=4)
+    model = MDN_LSTM(input_size=32+3, output_size=32, mdn_units=512, hidden_size=512, num_mixs=5)
+    
+    checkpoint_cb = ModelCheckpoint(
+        monitor="train_loss",
+        mode="min",
+        save_top_k=1,
+        save_last=True,
+        filename="mdn-{epoch:02d}-{train_loss:.4f}",
+    )
+    
+    trainer = pl.Trainer(
+        max_epochs=30,
+        accelerator="auto",
+        devices="auto",
+        callbacks=[checkpoint_cb],
+    )
+    trainer.fit(model, dataloader)
+    print("Training complete. Saving final checkpoint...")
+    trainer.save_checkpoint("MDN_LSTM_checkpoint.ckpt")
+    print("Final checkpoint saved as MDN_LSTM_checkpoint.ckpt")
+    print("Best checkpoint saved by Lightning under lightning_logs/.../checkpoints/")
+
+if __name__ == "__main__":
+    main()

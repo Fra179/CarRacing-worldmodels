@@ -2,145 +2,114 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
 import os
 import glob
 
 
-# --- 1. Residual Block Definition ---
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
+
+class VAE(pl.LightningModule):
+    def __init__(self, latent_size: int, lr: float = 1e-3, kl_weight: float = 0.0001):
         super().__init__()
-        # First Conv Layer
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3,
-                               stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-
-        # Second Conv Layer
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
-                               stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-
-        # Shortcut connection (if dimensions change, we project x)
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1,
-                          stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels)
-            )
-
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
-        return out
-
-
-# --- 2. The Residual VAE Module ---
-class ResidualVAE(pl.LightningModule):
-    def __init__(self, latent_size=32, lr=1e-3, kl_weight=0.0001):
-        super().__init__()
-        self.save_hyperparameters()
-
-        # Encoder: 64x64 -> 32x32 -> 16x16 -> 8x8 -> 4x4
-        self.encoder = nn.Sequential(
-            # Input: (3, 64, 64)
-            ResidualBlock(3, 32, stride=2),  # -> (32, 32, 32)
-            ResidualBlock(32, 64, stride=2),  # -> (64, 16, 16)
-            ResidualBlock(64, 128, stride=2),  # -> (128, 8, 8)
-            ResidualBlock(128, 256, stride=2)  # -> (256, 4, 4)
-        )
-
-        # Flatten size: 256 channels * 4 * 4
-        self.flat_size = 256 * 4 * 4
-
-        # Latent Projections
-        self.fc_mu = nn.Linear(self.flat_size, latent_size)
-        self.fc_logvar = nn.Linear(self.flat_size, latent_size)
-
-        # Decoder Input
-        self.decoder_input = nn.Linear(latent_size, self.flat_size)
-
-        # Decoder: Mirror of Encoder (using Upsample + ResBlock)
-        self.decoder = nn.Sequential(
-            ResidualBlock(256, 128, stride=1),
-            nn.Upsample(scale_factor=2),  # -> 8x8
-
-            ResidualBlock(128, 64, stride=1),
-            nn.Upsample(scale_factor=2),  # -> 16x16
-
-            ResidualBlock(64, 32, stride=1),
-            nn.Upsample(scale_factor=2),  # -> 32x32
-
-            ResidualBlock(32, 32, stride=1),  # Extra block to smooth features
-            nn.Upsample(scale_factor=2),  # -> 64x64
-
-            nn.Conv2d(32, 3, kernel_size=3, padding=1),
-            nn.Sigmoid()  # Output 0-1
-        )
-
-    def encode(self, x):
-        x = self.encoder(x)
-        x = x.view(x.size(0), -1)
-        return self.fc_mu(x), self.fc_logvar(x)
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def decode(self, z):
-        x = self.decoder_input(z)
-        x = x.view(x.size(0), 256, 4, 4)
-        x = self.decoder(x)
-        return x
-
+        self.latent_size = latent_size
+        self.lr = lr
+        self.kl_weight = kl_weight
+        
+        # encoder
+        self.enc_conv1 = nn.Conv2d(3,32,kernel_size=4,stride=2, padding=0)
+        self.enc_conv2 = nn.Conv2d(32,64,kernel_size=4,stride=2, padding=0)
+        self.enc_conv3 = nn.Conv2d(64,128,kernel_size=4,stride=2, padding=0)
+        self.enc_conv4 = nn.Conv2d(128,256,kernel_size=4,stride=2, padding=0)
+        
+        # z
+        self.mu = nn.Linear(1024, latent_size)
+        self.logvar = nn.Linear(1024, latent_size)
+        
+        # decoder
+        self.dec_conv1 = nn.ConvTranspose2d(latent_size, 128, kernel_size=5, stride=2, padding=0)
+        self.dec_conv2 = nn.ConvTranspose2d(128, 64, kernel_size=5, stride=2, padding=0)
+        self.dec_conv3 = nn.ConvTranspose2d(64, 32, kernel_size=6, stride=2, padding=0)
+        self.dec_conv4 = nn.ConvTranspose2d(32, 3, kernel_size=6, stride=2, padding=0)
+        
     def forward(self, x):
         mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        recon = self.decode(z)
-        return recon, mu, logvar
+        z = self.latent(mu, logvar)
+        out = self.decode(z)
+        
+        return out, mu, logvar   
+        
+    def encode(self, x):
+        batch_size = x.shape[0]
+        
+        out = F.relu(self.enc_conv1(x))
+        out = F.relu(self.enc_conv2(out))
+        out = F.relu(self.enc_conv3(out))
+        out = F.relu(self.enc_conv4(out))
+        out = out.reshape(batch_size, 1024)
+        
+        mu = self.mu(out)
+        logvar = self.logvar(out)
+        
+        return mu, logvar
+        
+    def decode(self, z):
+        batch_size = z.shape[0]
+        
+        out = z.view(batch_size, self.latent_size, 1, 1)
+        out = F.relu(self.dec_conv1(out))
+        out = F.relu(self.dec_conv2(out))
+        out = F.relu(self.dec_conv3(out))
+        out = torch.sigmoid(self.dec_conv4(out))
+        
+        return out
+        
+        
+    def latent(self, mu, logvar):
+        sigma = torch.exp(0.5*logvar)
+        eps = torch.randn_like(logvar).to(self.device)
+        z = mu + eps*sigma
+        
+        return z
+    
+    def obs_to_z(self, x):
+        mu, logvar = self.encode(x)
+        z = self.latent(mu, logvar)
+        
+        return z
+
+    def sample(self, z):
+        out = self.decode(z)
+        
+        return out
+    
+    def vae_loss(self, out, y, mu, logvar):
+        BCE = F.mse_loss(out, y, reduction="sum")
+        KL = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        loss = BCE + KL
+        return loss, BCE, KL
 
     def training_step(self, batch, batch_idx):
-        # Unwrap batch if it's a list (some dataloaders do this)
-        x = batch[0] if isinstance(batch, list) else batch
-
+        x = batch
         recon, mu, logvar = self(x)
 
-        # 1. Reconstruction Loss (MSE)
-        # Using reduction='mean' makes loss independent of image size
-        recon_loss = F.mse_loss(recon, x, reduction='mean')
+        loss, bce, kl_loss = self.vae_loss(recon, x, mu, logvar)
 
-        # 2. KL Divergence
-        # -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        kl_loss = kl_loss / x.size(0)  # Average over batch
-
-        # Total Loss
-        loss = recon_loss + (self.hparams.kl_weight * kl_loss)
-
-        self.log("train_loss", loss, prog_bar=True)
-        self.log("recon_loss", recon_loss, prog_bar=True)
-        self.log("kl_loss", kl_loss, prog_bar=True)
+        # Log per-epoch to enable ModelCheckpoint monitoring
+        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("recon_loss", bce, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("kl_loss", kl_loss, prog_bar=True, on_step=False, on_epoch=True)
 
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
 
 
 class CarRacingDataset(Dataset):
     def __init__(self, data_dir):
-        self.files = glob.glob(f"{data_dir}/*.npz")  # Assuming .npz from previous script
-        if not self.files:
-            # Fallback for .npy if you used a different script
-            self.files = glob.glob(f"{data_dir}/*.npy")
-            self.mode = 'npy'
-        else:
-            self.mode = 'npz'
+        self.files = glob.glob(f"{data_dir}/*.npy")
 
         print(f"Found {len(self.files)} files.")
 
@@ -150,17 +119,7 @@ class CarRacingDataset(Dataset):
     def __getitem__(self, idx):
         file_path = self.files[idx]
 
-        if self.mode == 'npz':
-            # Load full episode -> Random Frame
-            data = np.load(file_path)
-            obs = data['obs']  # Shape (Seq_Len, 64, 64, 3)
-            # Pick one random frame from the episode to train on
-            # This avoids loading the whole episode into VRAM
-            frame_idx = np.random.randint(0, len(obs))
-            img = obs[frame_idx]
-        else:
-            # Load single frame .npy
-            img = np.load(file_path)
+        img = np.load(file_path)
 
         # Preprocess
         # Convert to Tensor (C, H, W) and Float 0-1
@@ -177,12 +136,11 @@ class CarRacingDataset(Dataset):
 
 def main():
     # --- Configuration ---
-    DATA_DIR = "../car_racing_data"  # Path to your .npz or .npy files
+    DATA_DIR = "car_racing_data" 
     BATCH_SIZE = 64
     MAX_EPOCHS = 20
     LATENT_SIZE = 32
 
-    # 1. Setup Data
     if not os.path.exists(DATA_DIR):
         print(f"Error: Directory {DATA_DIR} not found. Please run the data collection script first.")
         return
@@ -191,15 +149,23 @@ def main():
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
 
     # 2. Setup Model
-    model = ResidualVAE(latent_size=LATENT_SIZE, lr=1e-3, kl_weight=0.0001)
+    model = VAE(latent_size=LATENT_SIZE) #, lr=1e-3, kl_weight=0.0001)
 
     # 3. Trainer
-    # Accelerator='auto' will automatically pick GPU if available
+    checkpoint_cb = ModelCheckpoint(
+        monitor="train_loss",
+        mode="min",
+        save_top_k=1,
+        save_last=True,
+        filename="vae-{epoch:02d}-{train_loss:.4f}",
+    )
+
     trainer = pl.Trainer(
         max_epochs=MAX_EPOCHS,
         accelerator="auto",
         devices=1,
-        enable_progress_bar=True
+        enable_progress_bar=True,
+        callbacks=[checkpoint_cb],
     )
 
     print("Starting training...")
@@ -208,7 +174,26 @@ def main():
     # 4. Save
     model_path = "residual_vae_final.ckpt"
     trainer.save_checkpoint(model_path)
-    print(f"Training complete. Model saved to {model_path}")
+    print(f"Training complete. Final model saved to {model_path}")
+    print("Best checkpoint saved by Lightning under lightning_logs/.../checkpoints/")
+
+    # Visualize with matplotlib a couple of examples
+    import matplotlib.pyplot as plt
+    model.eval()
+    sample_batch = next(iter(dataloader))
+    with torch.no_grad():
+        recon_batch, _, _ = model(sample_batch.to(model.device))
+    sample_batch = sample_batch.cpu()
+    recon_batch = recon_batch.cpu()
+    for i in range(5):
+        fig, axes = plt.subplots(1, 2)
+        axes[0].imshow(sample_batch[i].permute(1, 2, 0))
+        axes[0].set_title("Original")
+        axes[1].imshow(recon_batch[i].permute(1, 2, 0))
+        axes[1].set_title("Reconstructed")
+        plt.show()
+        plt.imsave(f"reconstruction_{i}.png", recon_batch[i].permute(1, 2, 0).numpy())
+
 
 
 if __name__ == '__main__':

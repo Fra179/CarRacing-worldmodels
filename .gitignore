@@ -181,5 +181,14 @@ fabric.properties
 *.npz
 
 **/lightning_logs/
-**/*.ckpt
+**/*.png
 *.lock
+videos/
+good-weights/
+car_racing_data/
+car_racing_data_batched_m/
+.vscode/
+*.tar
+*.tar.gz
+*.old
+old/
